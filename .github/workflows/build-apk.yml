@@ -24,6 +24,9 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
@@ -42,11 +45,18 @@ jobs:
       - name: Sync
         run: npx cap sync android
 
-      - name: Make Gradle executable
+      - name: Set Gradle wrapper permissions
         run: chmod +x android/gradlew
 
+      - name: Update Gradle wrapper version
+        run: |
+          cd android
+          ./gradlew wrapper --gradle-version=8.7 --distribution-type=bin
+
       - name: Build APK
-        run: cd android && ./gradlew assembleDebug --no-daemon -Dorg.gradle.jvmargs="-Xmx3g"
+        run: |
+          cd android
+          ./gradlew assembleDebug --no-daemon -Dorg.gradle.jvmargs="-Xmx3g"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
