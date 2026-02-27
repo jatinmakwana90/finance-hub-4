@@ -1,0 +1,8 @@
+{
+  "appId": "com.myfinancehub.app",
+  "appName": "My Finance Hub",
+  "webDir": "build",
+  "server": {
+    "androidScheme": "https"
+  }
+}
