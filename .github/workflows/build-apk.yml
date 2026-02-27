@@ -43,10 +43,18 @@ jobs:
         run: npx cap sync android
 
       - name: Add Android permissions
-        run: |
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_SMS"/>\n    <uses-permission android:name="android.permission.RECEIVE_SMS"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <application|' "$MANIFEST"
-          echo "Permissions added"
+        run: python3 -c "
+import re
+f = open('android/app/src/main/AndroidManifest.xml', 'r')
+content = f.read()
+f.close()
+perms = '<uses-permission android:name=\"android.permission.INTERNET\"/>\n    <uses-permission android:name=\"android.permission.READ_SMS\"/>\n    <uses-permission android:name=\"android.permission.RECEIVE_SMS\"/>\n    <uses-permission android:name=\"android.permission.POST_NOTIFICATIONS\"/>\n    '
+content = content.replace('<application', perms + '<application', 1)
+f = open('android/app/src/main/AndroidManifest.xml', 'w')
+f.write(content)
+f.close()
+print('Permissions added')
+"
 
       - name: Make Gradle executable
         run: chmod +x android/gradlew
@@ -60,20 +68,3 @@ jobs:
           name: MyFinanceHub-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
-```
-**Commit changes** ✅
-
----
-
-## ✅ Final structure should look like this:
-```
-📁 .github/
-   📁 workflows/
-      📄 build-apk.yml
-📁 src/
-   📄 App.jsx
-   📄 main.jsx
-📄 index.html
-📄 vite.config.js
-📄 package.json
-📄 capacitor.config.json
