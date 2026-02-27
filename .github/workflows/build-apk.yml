@@ -27,39 +27,25 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Accept Android licenses
+      - name: Accept licenses
         run: yes | sdkmanager --licenses || true
 
-      - name: Install npm packages
+      - name: Install packages
         run: npm install
 
-      - name: Build with Vite
+      - name: Build app
         run: npm run build
 
-      - name: Add Android platform
+      - name: Add Android
         run: npx cap add android
 
-      - name: Sync Capacitor
+      - name: Sync
         run: npx cap sync android
-
-      - name: Add Android permissions
-        run: python3 -c "
-import re
-f = open('android/app/src/main/AndroidManifest.xml', 'r')
-content = f.read()
-f.close()
-perms = '<uses-permission android:name=\"android.permission.INTERNET\"/>\n    <uses-permission android:name=\"android.permission.READ_SMS\"/>\n    <uses-permission android:name=\"android.permission.RECEIVE_SMS\"/>\n    <uses-permission android:name=\"android.permission.POST_NOTIFICATIONS\"/>\n    '
-content = content.replace('<application', perms + '<application', 1)
-f = open('android/app/src/main/AndroidManifest.xml', 'w')
-f.write(content)
-f.close()
-print('Permissions added')
-"
 
       - name: Make Gradle executable
         run: chmod +x android/gradlew
 
-      - name: Build debug APK
+      - name: Build APK
         run: cd android && ./gradlew assembleDebug --no-daemon -Dorg.gradle.jvmargs="-Xmx3g"
 
       - name: Upload APK
