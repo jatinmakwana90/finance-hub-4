@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android APK - My Finance Hub
 
 on:
   push:
@@ -8,12 +8,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js 20
+      - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -24,43 +22,33 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v3
+      - uses: android-actions/setup-android@v3
 
       - name: Accept licenses
         run: yes | sdkmanager --licenses || true
 
-      - name: Install packages
-        run: npm install
+      - run: npm install
+      - run: npm run build
+      - run: npx cap add android
+      - run: npx cap sync android
+      - run: chmod +x android/gradlew
+      - run: cd android && ./gradlew wrapper --gradle-version=8.7 --distribution-type=bin
 
-      - name: Build app
-        run: npm run build
-
-      - name: Add Android
-        run: npx cap add android
-
-      - name: Sync
-        run: npx cap sync android
-
-      - name: Set Gradle wrapper permissions
-        run: chmod +x android/gradlew
-
-      - name: Update Gradle wrapper version
+      - name: VAPT patches for Play Store
         run: |
-          cd android
-          ./gradlew wrapper --gradle-version=8.7 --distribution-type=bin
+          M="android/app/src/main/AndroidManifest.xml"
+          sed -i 's/android:usesCleartextTraffic="true"/android:usesCleartextTraffic="false"/' "$M" || true
+          grep -q "POST_NOTIFICATIONS" "$M" || sed -i '/<uses-permission android:name="android.permission.INTERNET"/a\    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>\n    <uses-permission android:name="android.permission.VIBRATE"/>' "$M"
+          G="android/app/build.gradle"
+          sed -i 's/minSdkVersion [0-9]*/minSdkVersion 24/' "$G" || true
+          sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/' "$G" || true
 
       - name: Build APK
-        run: |
-          cd android
-          ./gradlew assembleDebug --no-daemon -Dorg.gradle.jvmargs="-Xmx3g"
+        run: cd android && ./gradlew assembleDebug --no-daemon -Dorg.gradle.jvmargs="-Xmx3g"
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: MyFinanceHub-APK
+          name: MyFinanceHub-APK-v4
           path: android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
