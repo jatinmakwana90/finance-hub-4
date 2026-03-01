@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
       - uses: actions/checkout@v4
 
@@ -28,26 +29,50 @@ jobs:
       - name: Accept licenses
         run: yes | sdkmanager --licenses || true
 
-      - run: npm install
-      - run: npm run build
-      - run: npx cap add android
-      - run: npx cap sync android
-      - run: chmod +x android/gradlew
-      - run: cd android && ./gradlew wrapper --gradle-version=8.7 --distribution-type=bin
+      - name: Install dependencies
+        run: npm install
 
-      - name: VAPT patches for Play Store
+      - name: Build web app
+        run: npm run build
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Fix Gradle wrapper permissions
+        run: chmod +x android/gradlew
+
+      - name: Update Gradle wrapper to 8.7
+        run: cd android && ./gradlew wrapper --gradle-version=8.7 --distribution-type=bin
+
+      - name: Show AndroidManifest before patching
+        run: cat android/app/src/main/AndroidManifest.xml
+
+      - name: Apply security patches (VAPT)
         run: |
           M="android/app/src/main/AndroidManifest.xml"
-          sed -i 's/android:usesCleartextTraffic="true"/android:usesCleartextTraffic="false"/' "$M" || true
-          grep -q "POST_NOTIFICATIONS" "$M" || sed -i '/<uses-permission android:name="android.permission.INTERNET"/a\    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>\n    <uses-permission android:name="android.permission.VIBRATE"/>' "$M"
+          # Remove cleartext traffic (security requirement)
+          sed -i 's/android:usesCleartextTraffic="true"//g' "$M" || true
+          # Add notification permissions if missing
+          if ! grep -q "POST_NOTIFICATIONS" "$M"; then
+            sed -i 's|<uses-permission android:name="android.permission.INTERNET"/>|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>\n    <uses-permission android:name="android.permission.VIBRATE"/>|' "$M"
+          fi
+          echo "=== Patched Manifest ===" && cat "$M"
+
+      - name: Patch build.gradle SDK versions
+        run: |
           G="android/app/build.gradle"
-          sed -i 's/minSdkVersion [0-9]*/minSdkVersion 24/' "$G" || true
-          sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/' "$G" || true
+          sed -i 's/minSdkVersion [0-2][0-9]/minSdkVersion 24/g' "$G" || true
+          sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/g' "$G" || true
+          grep -E "minSdk|targetSdk|compileSdk" "$G" || true
 
-      - name: Build APK
-        run: cd android && ./gradlew assembleDebug --no-daemon -Dorg.gradle.jvmargs="-Xmx3g"
+      - name: Build debug APK
+        run: cd android && ./gradlew assembleDebug --no-daemon --stacktrace -Dorg.gradle.jvmargs="-Xmx3g"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
           name: MyFinanceHub-APK-v4
           path: android/app/build/outputs/apk/debug/app-debug.apk
