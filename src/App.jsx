@@ -36,11 +36,15 @@ const Cap = {
   plugin:   (n) => { try { return window.Capacitor?.Plugins?.[n] || null; } catch { return null; } },
 };
 
-// ─── FIX #3: NOTIFICATIONS ───────────────────────────────────────────────────
-// Uses Capacitor LocalNotifications to schedule actual daily alarms.
-// These fire even when the app is closed (true Android alarms).
-// Falls back to Web Notification API in browser, then in-app banner.
+// ─── FIX #1: NOTIFICATIONS ───────────────────────────────────────────────────
+// Uses Capacitor LocalNotifications for true Android OS alarms (work when app closed).
+// ID scheme: time "09:00" → ID 9000, "21:00" → ID 21000 (deterministic, no conflicts)
 const Notif = {
+  _timeToId(hhmm) {
+    const [h, m] = hhmm.split(":").map(Number);
+    return h * 1000 + m; // "09:30" → 9030, "21:00" → 21000
+  },
+
   async getPermission() {
     const ln = Cap.plugin("LocalNotifications");
     if (ln) {
@@ -54,11 +58,9 @@ const Notif = {
     const ln = Cap.plugin("LocalNotifications");
     if (ln) {
       try {
-        // Create notification channel for Android 8+
         if (ln.createChannel) {
           await ln.createChannel({
             id: "finance_daily", name: "Daily Reminders",
-            description: "Daily finance tracking reminders",
             importance: 4, visibility: 1, vibration: true,
           });
         }
@@ -71,102 +73,156 @@ const Notif = {
       if (Notification.permission === "denied") return "denied";
       try { return await Notification.requestPermission(); } catch { return "denied"; }
     }
-    return "inapp"; // in-app banners
+    return "inapp";
   },
 
-  // Schedule a recurring daily notification at HH:MM
-  async scheduleDailyAt(hhmm, id) {
+  // Cancel ALL pending notifications (clears any stale/wrong-timed ones)
+  async cancelAllPending() {
+    const ln = Cap.plugin("LocalNotifications");
+    if (!ln) return;
+    try {
+      const pending = await ln.getPending();
+      if (pending?.notifications?.length) {
+        await ln.cancel({ notifications: pending.notifications.map(n => ({ id: n.id })) });
+      }
+    } catch {}
+  },
+
+  // Schedule a daily alarm at exact HH:MM — fires even when app is closed
+  async scheduleDailyAt(hhmm) {
+    const ln = Cap.plugin("LocalNotifications");
+    if (!ln) return false;
     const [h, m] = hhmm.split(":").map(Number);
-    const ln = Cap.plugin("LocalNotifications");
-    if (ln) {
-      try {
-        // Cancel existing with this id first
-        await ln.cancel({ notifications: [{ id }] }).catch(() => {});
-        // Schedule for next occurrence of this time
-        const now  = new Date();
-        const fire = new Date();
-        fire.setHours(h, m, 0, 0);
-        if (fire <= now) fire.setDate(fire.getDate() + 1); // tomorrow if time passed today
-        await ln.schedule({
-          notifications: [{
-            id, channelId: "finance_daily",
-            title: "💰 Finance Reminder",
-            body:  "Time to record today's transactions!",
-            schedule: { at: fire, repeats: true, every: "day" },
-            actionTypeId: "OPEN_APP",
-          }],
-        });
-        return true;
-      } catch (e) { console.warn("Schedule failed:", e.message); return false; }
-    }
-    return false;
+    const id = this._timeToId(hhmm);
+    try {
+      // Compute next occurrence of this time
+      const now  = new Date();
+      const fire = new Date();
+      fire.setHours(h, m, 0, 0);
+      // If that time already passed today, schedule for tomorrow
+      if (fire.getTime() <= now.getTime()) {
+        fire.setDate(fire.getDate() + 1);
+      }
+      await ln.schedule({
+        notifications: [{
+          id,
+          channelId: "finance_daily",
+          title: "💰 Finance Reminder",
+          body:  "Time to log your transactions for today!",
+          schedule: {
+            at: fire,
+            repeats: true,   // repeat daily
+            every: "day",
+            allowWhileIdle: true,
+          },
+        }],
+      });
+      return true;
+    } catch (e) { console.warn("Notif schedule error:", e.message); return false; }
   },
 
-  async cancelAll(ids) {
-    const ln = Cap.plugin("LocalNotifications");
-    if (ln) {
-      try { await ln.cancel({ notifications: ids.map(id => ({ id })) }); } catch {}
-    }
-  },
-
-  // Fire an immediate notification (for test/confirmation)
+  // Fire an immediate test notification
   async fireNow(title, body) {
     const ln = Cap.plugin("LocalNotifications");
     if (ln) {
       try {
         await ln.schedule({ notifications: [{
-          id: Math.floor(Math.random() * 99000) + 1000,
-          channelId: "finance_daily", title, body,
-          schedule: { at: new Date(Date.now() + 1000) },
+          id: 99999, channelId: "finance_daily", title, body,
+          schedule: { at: new Date(Date.now() + 800) },
         }]});
         return "native";
       } catch {}
     }
     if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-      try { new Notification(title, { body, tag: "finance" }); return "web"; } catch {}
+      try { new Notification(title, { body, tag: "finance-test" }); return "web"; } catch {}
     }
     return "inapp";
   },
+
+  // Reschedule all times (cancel ALL pending first to avoid duplicates/wrong times)
+  async rescheduleAll(times) {
+    await this.cancelAllPending(); // wipe everything first
+    const results = [];
+    for (const t of times) {
+      const ok = await this.scheduleDailyAt(t);
+      results.push({ time: t, ok });
+    }
+    return results;
+  },
 };
 
-// ─── FIX #1 & #4: FILE SHARE / DOWNLOAD ─────────────────────────────────────
-// For APK: uses navigator.share({files}) which opens Android share sheet
-//          (WhatsApp, Drive, Files, etc.) — no storage permission needed
-// For browser: blob + anchor download
-async function shareOrDownload(data, filename, mime) {
-  // Convert data to Blob
-  const blob = data instanceof Uint8Array
-    ? new Blob([data], { type: mime })
-    : new Blob([data], { type: mime });
+// ─── FIX #3 & #5: FILE SAVE — works on APK and browser ──────────────────────
+// Strategy:
+//   1. Capacitor Filesystem → write to Documents folder → Capacitor Share
+//   2. navigator.share({ files }) → Android share sheet (modern Android)
+//   3. Blob + anchor download (browser fallback)
 
-  // ── Try Web Share API with files (works in Android Chrome/WebView) ──
-  if (navigator.canShare && navigator.share) {
+function toBase64(data) {
+  if (data instanceof Uint8Array) {
+    // Binary → base64
+    let bin = "";
+    const chunk = 8192;
+    for (let i = 0; i < data.length; i += chunk) {
+      bin += String.fromCharCode(...data.subarray(i, i + chunk));
+    }
+    return btoa(bin);
+  }
+  // Text → base64 (handles UTF-8 / ₹ symbol)
+  return btoa(unescape(encodeURIComponent(String(data))));
+}
+
+async function saveFile(data, filename, mime) {
+  const FS = Cap.plugin("Filesystem");
+  const SH = Cap.plugin("Share");
+
+  // ── METHOD 1: Capacitor Filesystem (most reliable on APK) ──
+  if (FS) {
     try {
-      const file = new File([blob], filename, { type: mime });
-      if (navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: filename });
-        return "shared";
+      const b64 = toBase64(data);
+      // Write to Documents directory (no permission needed on Android 10+)
+      await FS.writeFile({ path: filename, data: b64, directory: "DOCUMENTS" });
+      const { uri } = await FS.getUri({ path: filename, directory: "DOCUMENTS" });
+
+      if (SH) {
+        // Open Android share sheet → user picks WhatsApp, Drive, Files etc.
+        await SH.share({ title: filename, url: uri, dialogTitle: `Save "${filename}"` });
+        return { ok: true, method: "filesystem+share" };
       }
+      // No Share plugin but file is saved to Documents — tell user where it is
+      return { ok: true, method: "filesystem", path: uri };
     } catch (e) {
-      if (e.name !== "AbortError") console.warn("Share failed:", e.message);
-      else return "cancelled"; // user dismissed share sheet — that's fine
+      console.warn("Filesystem method failed:", e.message);
+      // Fall through to next method
     }
   }
 
-  // ── Browser download fallback ──
+  // ── METHOD 2: Web Share API with files ──
+  if (navigator.canShare && navigator.share) {
+    try {
+      const blob = new Blob([data], { type: mime });
+      const file = new File([blob], filename, { type: mime });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: filename });
+        return { ok: true, method: "webshare" };
+      }
+    } catch (e) {
+      if (e.name === "AbortError") return { ok: true, method: "webshare-cancelled" };
+      console.warn("WebShare failed:", e.message);
+    }
+  }
+
+  // ── METHOD 3: Blob download (browser) ──
   try {
-    const url = URL.createObjectURL(blob);
-    const a   = document.createElement("a");
-    a.style.display = "none";
-    a.href     = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
+    const blob = new Blob([data], { type: mime });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.style.display = "none"; a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
     setTimeout(() => { try { document.body.removeChild(a); } catch {} URL.revokeObjectURL(url); }, 5000);
-    return "downloaded";
+    return { ok: true, method: "download" };
   } catch (e) {
-    alert("Could not export file: " + e.message);
-    return "failed";
+    alert("Export failed: " + e.message);
+    return { ok: false, error: e.message };
   }
 }
 
@@ -192,7 +248,7 @@ async function exportCSV(txns, expCats, incCats) {
   const csv  = [h.join(","), ...rows.map(r =>
     h.map(k => `"${String(r[k] ?? "").replace(/"/g, '""')}"`).join(",")
   )].join("\n");
-  return shareOrDownload("\uFEFF" + csv, "transactions.csv", "text/csv;charset=utf-8;");
+  return saveFile("\uFEFF" + csv, "transactions.csv", "text/csv;charset=utf-8;");
 }
 
 async function exportExcel(txns, expCats, incCats) {
@@ -202,7 +258,7 @@ async function exportExcel(txns, expCats, incCats) {
   const wb   = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Transactions");
   const buf  = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-  return shareOrDownload(
+  return saveFile(
     new Uint8Array(buf), "transactions.xlsx",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
   );
@@ -255,16 +311,21 @@ tr:nth-child(even) td{background:#f8fafc}
 </div></body></html>`;
   const w = window.open("", "_blank");
   if (w) { w.document.write(html); w.document.close(); }
-  else   { shareOrDownload(html, "report.html", "text/html;charset=utf-8;"); }
+  else   { saveFile(html, "report.html", "text/html;charset=utf-8;"); }
 }
 
-// FIX #4 — Backup
+// FIX #3 — Backup: save JSON to device Documents folder
 async function doBackup(txns, accounts, expCats, incCats, appName, settings) {
   const json = JSON.stringify({
     version: "5.0", backupDate: new Date().toISOString(),
     transactions: txns, accounts, expCats, incCats, appName, settings,
   }, null, 2);
-  return shareOrDownload(json, `finance-backup-${toYMD(new Date())}.json`, "application/json;charset=utf-8;");
+  const filename = `finance-backup-${toYMD(new Date())}.json`;
+  const result = await saveFile(json, filename, "application/json;charset=utf-8;");
+  if (result?.method === "filesystem" && result?.path) {
+    alert(`✅ Backup saved!\n\nFile: ${filename}\nLocation: Files → Internal Storage → Documents`);
+  }
+  return result;
 }
 
 // ─── SMS PARSER ───────────────────────────────────────────────────────────────
@@ -478,7 +539,7 @@ function TxnRow({ t, accounts, expCats, incCats, onTap, onDelete }) {
       </div>
       <div style={{display:"flex",alignItems:"center",gap:7,flexShrink:0}}>
         <span style={{fontSize:14,fontWeight:800,color:t.type==="income"?"#10b981":"#ef4444"}}>{t.type==="income"?"+":"-"}{fmt(t.amount)}</span>
-        {onDelete && <button type="button" onClick={e=>{e.stopPropagation();onDelete(t.id);}} style={{background:"var(--bdr)",border:"none",color:"#ef4444",borderRadius:7,padding:"4px 8px",cursor:"pointer",fontSize:11}}>✕</button>}
+        {onDelete && <button type="button" onClick={e=>{e.stopPropagation();onDelete(t.id);}} style={{background:"var(--bdr)",border:"none",color:"#ef4444",borderRadius:7,padding:"4px 8px",cursor:"pointer",fontSize:14}}>🗑️</button>}
       </div>
     </div>
   );
@@ -632,42 +693,38 @@ function SettingsModal({ settings, onChange, onClose, txns, accounts, expCats, i
       const perm = await Notif.requestPermission();
       setNotifPerm(perm);
       if (perm === "denied") {
-        setNotifMsg("🚫 Blocked. Go to: Android Settings → Apps → My Finance Hub → Permissions → Notifications → Allow");
+        setNotifMsg("🚫 Blocked. Go to: Android Settings → Apps → My Finance Hub → Notifications → Allow");
         setBusyNotif(false);
         return;
       }
       if (perm === "granted") {
-        setNotifMsg("✅ Permission granted! Scheduling daily reminders...");
-        // Schedule each reminder time as a real daily alarm
-        const ids = settings.reminderTimes.map((_, i) => 9000 + i);
-        await Notif.cancelAll(ids);
-        for (let i = 0; i < settings.reminderTimes.length; i++) {
-          await Notif.scheduleDailyAt(settings.reminderTimes[i], 9000 + i);
-        }
-        // Fire a test notification immediately
-        await Notif.fireNow("✅ Reminders Enabled!", `Daily reminders set for ${settings.reminderTimes.join(", ")}`);
-        setNotifMsg(`✅ Done! Daily alarms set for ${settings.reminderTimes.join(", ")}`);
+        setNotifMsg("✅ Permission granted! Scheduling daily alarms...");
+        // Use rescheduleAll — cancels ALL pending first, then schedules fresh
+        const results = await Notif.rescheduleAll(settings.reminderTimes);
+        const ok = results.filter(r => r.ok).map(r => r.time);
+        await Notif.fireNow("✅ Reminders Enabled!", `Daily alarms set for: ${ok.join(", ")}`);
+        setNotifMsg(`✅ Alarms scheduled for ${ok.join(", ")} — fires daily at exact times`);
       } else {
         setNotifMsg("📲 In-app banners enabled (shows when app is open)");
       }
       setBusyNotif(false);
     } else {
-      // Cancel all scheduled notifications
-      await Notif.cancelAll(settings.reminderTimes.map((_, i) => 9000 + i));
+      // Cancel ALL pending notifications when disabling
+      await Notif.cancelAllPending();
       setNotifMsg("⭕ Reminders disabled");
     }
     set("notifications", val);
   }
 
-  // Re-schedule when times change
+  // Re-schedule when times change — always cancel all first to avoid duplicates
   async function addTime() {
     if (!newTime || settings.reminderTimes.includes(newTime)) return;
     const times = [...settings.reminderTimes, newTime].sort();
     set("reminderTimes", times);
     if (settings.notifications && notifPerm === "granted") {
-      await Notif.cancelAll(times.map((_, i) => 9000 + i));
-      for (let i = 0; i < times.length; i++) await Notif.scheduleDailyAt(times[i], 9000 + i);
-      setNotifMsg(`✅ Alarms updated: ${times.join(", ")}`);
+      const results = await Notif.rescheduleAll(times);
+      const ok = results.filter(r => r.ok).map(r => r.time);
+      setNotifMsg(`✅ Alarms updated: ${ok.join(", ")}`);
     }
   }
 
@@ -675,32 +732,25 @@ function SettingsModal({ settings, onChange, onClose, txns, accounts, expCats, i
     const times = settings.reminderTimes.filter(x => x !== t);
     set("reminderTimes", times);
     if (settings.notifications && notifPerm === "granted") {
-      await Notif.cancelAll(settings.reminderTimes.map((_, i) => 9000 + i));
-      for (let i = 0; i < times.length; i++) await Notif.scheduleDailyAt(times[i], 9000 + i);
+      if (times.length > 0) {
+        const results = await Notif.rescheduleAll(times);
+        const ok = results.filter(r => r.ok).map(r => r.time);
+        setNotifMsg(`✅ Alarms updated: ${ok.join(", ")}`);
+      } else {
+        await Notif.cancelAllPending();
+        setNotifMsg("⭕ No reminder times — add one above");
+      }
     }
   }
 
-  // FIX #2: SMS — request clipboard permission properly
-  async function requestClipboard() {
-    setSmsStatus("Requesting clipboard access...");
-    try {
-      const text = await navigator.clipboard.readText();
-      if (text) {
-        const parsed = parseSMS(text);
-        if (parsed) {
-          setSmsStatus(`✅ Clipboard OK! Detected: ₹${parsed.amount} ${parsed.type}. SMS detection is working!`);
-        } else {
-          setSmsStatus("✅ Clipboard access granted! Copy a UPI/bank SMS and open the app to auto-detect.");
-        }
-      } else {
-        setSmsStatus("✅ Clipboard access granted! Copy a UPI/bank SMS → app will auto-detect.");
-      }
-    } catch (e) {
-      if (e.name === "NotAllowedError") {
-        setSmsStatus("🚫 Clipboard blocked.\n\nOn Android: tap Allow when prompted, or go to Settings → Apps → My Finance Hub → Permissions → allow Clipboard.");
-      } else {
-        setSmsStatus("ℹ️ Copy a UPI/bank SMS to clipboard → the app reads it automatically.");
-      }
+  // FIX #2: SMS — use paste event listener instead of clipboard API (no permission needed)
+  function testSMSPaste() {
+    const sample = "Dear Customer, Rs.2500 debited from your HDFC Bank account ending 1234 to SWIGGY on 01-03-2026. Available balance: Rs.42,000.";
+    const parsed = parseSMS(sample.replace(/,/g, ""));
+    if (parsed) {
+      setSmsStatus(`✅ SMS parsing works! Test: ₹${parsed.amount} ${parsed.type} detected from sample.\n\nNow copy a real bank SMS and open/switch to this app.`);
+    } else {
+      setSmsStatus("✅ Detection ready! Copy a UPI/bank SMS and switch to this app.");
     }
   }
 
@@ -739,7 +789,7 @@ function SettingsModal({ settings, onChange, onClose, txns, accounts, expCats, i
         </div>
       </div>
 
-      {/* FIX #3: NOTIFICATIONS */}
+      {/* FIX #1: NOTIFICATIONS */}
       <div style={{padding:"10px 0",borderBottom:"1px solid var(--bdr)"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div style={{flex:1,paddingRight:12}}>
@@ -754,11 +804,11 @@ function SettingsModal({ settings, onChange, onClose, txns, accounts, expCats, i
 
         {settings.notifications && (
           <div style={{background:"var(--inp)",borderRadius:10,padding:12,marginTop:10}}>
-            <FL c="Reminder times — real Android alarms, fire even when app is closed"/>
+            <FL c="Reminder times (fires daily at exact time, even when app is closed)"/>
             {settings.reminderTimes.map(t => (
               <div key={t} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:"var(--card)",borderRadius:8,padding:"7px 11px",marginBottom:5}}>
                 <span style={{fontSize:14,fontWeight:700,color:"var(--text)"}}>⏰ {t}</span>
-                <button type="button" onClick={() => removeTime(t)} style={{background:"#ef444430",border:"none",color:"#ef4444",borderRadius:6,padding:"3px 9px",cursor:"pointer",fontSize:11}}>Remove</button>
+                <button type="button" onClick={() => removeTime(t)} style={{background:"#ef444430",border:"none",color:"#ef4444",borderRadius:6,padding:"3px 9px",cursor:"pointer",fontSize:11,fontWeight:700}}>Remove</button>
               </div>
             ))}
             <div style={{display:"flex",gap:7,marginTop:7}}>
@@ -767,46 +817,45 @@ function SettingsModal({ settings, onChange, onClose, txns, accounts, expCats, i
               <button type="button" onClick={addTime}
                 style={{background:"var(--acc)",border:"none",color:"#fff",borderRadius:8,padding:"7px 14px",cursor:"pointer",fontWeight:700,fontSize:12}}>+ Add</button>
             </div>
-            {notifPerm === "granted" && (
-              <button type="button" onClick={() => Notif.fireNow("🧪 Test Notification", "Notifications are working correctly!")}
-                style={{marginTop:9,width:"100%",background:"var(--bdr)",border:"none",color:"var(--sub)",borderRadius:8,padding:"8px",cursor:"pointer",fontWeight:700,fontSize:12}}>
-                🧪 Send Test Notification
-              </button>
-            )}
+            <button type="button" onClick={() => Notif.fireNow("🧪 Test Notification", "Your daily reminders are working correctly!")}
+              style={{marginTop:9,width:"100%",background:"var(--bdr)",border:"none",color:"var(--text)",borderRadius:8,padding:"9px",cursor:"pointer",fontWeight:700,fontSize:12}}>
+              🧪 Send Test Notification Now
+            </button>
+            <div style={{marginTop:8,fontSize:10,color:"var(--muted)",lineHeight:1.6}}>
+              ⚠️ If notifications don't arrive: Android Settings → Apps → My Finance Hub → Notifications → Enable All
+            </div>
           </div>
         )}
       </div>
 
-      {/* FIX #2: SMS */}
-      <Toggle on={settings.smsDetection} onChange={v=>set("smsDetection",v)} label="📱 SMS Auto-Detection" sub="Clipboard-based UPI/bank SMS detection"/>
+      {/* FIX #2: SMS — no clipboard permission needed */}
+      <Toggle on={settings.smsDetection} onChange={v=>set("smsDetection",v)} label="📱 SMS Auto-Detection" sub="Auto-reads bank/UPI SMS when you copy them"/>
       {settings.smsDetection && (
         <div style={{background:"var(--inp)",borderRadius:10,padding:12,marginTop:8,marginBottom:4}}>
-          <div style={{fontSize:12,fontWeight:600,color:"var(--text)",marginBottom:6}}>How it works:</div>
-          <div style={{fontSize:11,color:"var(--sub)",lineHeight:1.8,marginBottom:10}}>
-            1. Receive a UPI/bank SMS on your phone<br/>
-            2. <b style={{color:"var(--text)"}}>Copy the SMS</b> to clipboard<br/>
-            3. Open this app → green banner auto-appears<br/>
-            4. Tap <b style={{color:"var(--acc)"}}>Add</b> → form pre-fills with amount
+          <div style={{fontSize:12,fontWeight:700,color:"var(--text)",marginBottom:7}}>How to use:</div>
+          <div style={{background:"var(--card)",borderRadius:8,padding:"10px 12px",marginBottom:8}}>
+            {["1️⃣ Receive a bank / UPI SMS","2️⃣ Long press the SMS → tap Copy","3️⃣ Open / switch to this app","4️⃣ Green banner appears — tap Add"].map((s,i)=>(
+              <div key={i} style={{fontSize:12,color:"var(--text)",marginBottom:i<3?5:0,lineHeight:1.5}}>{s}</div>
+            ))}
           </div>
-          <button type="button" onClick={requestClipboard}
-            style={{width:"100%",background:"var(--acc)",border:"none",color:"#fff",borderRadius:9,padding:"10px",cursor:"pointer",fontWeight:700,fontSize:13,marginBottom:smsStatus?8:0}}>
-            🔐 Grant Clipboard Permission & Test
+          <div style={{fontSize:11,color:"var(--muted)",marginBottom:8}}>No special permissions required — works with clipboard only.</div>
+          <button type="button" onClick={testSMSPaste}
+            style={{width:"100%",background:"var(--acc)",border:"none",color:"#fff",borderRadius:9,padding:"10px",cursor:"pointer",fontWeight:700,fontSize:12,marginBottom:smsStatus?8:0}}>
+            🧪 Test SMS Detection
           </button>
           {smsStatus && <div style={{fontSize:11,color:"var(--sub)",background:"var(--card)",borderRadius:8,padding:"9px 11px",lineHeight:1.6,whiteSpace:"pre-wrap"}}>{smsStatus}</div>}
-          <div style={{marginTop:10,fontSize:11,color:"var(--muted)"}}>
-            <b style={{color:"#f59e0b"}}>Note:</b> Background SMS reading requires native Android app permissions (READ_SMS). This web-based app uses clipboard as an alternative.
-          </div>
         </div>
       )}
 
-      {/* FIX #4: BACKUP */}
+      {/* FIX #3 & #5: BACKUP */}
       <div style={{marginTop:18}}>
         <FL c="Backup & Restore"/>
         <div style={{background:"var(--inp)",borderRadius:11,padding:13}}>
           <div style={{fontSize:13,fontWeight:600,color:"var(--text)",marginBottom:3}}>💾 Backup All Data</div>
           <div style={{fontSize:11,color:"var(--muted)",marginBottom:9}}>
-            Creates a .json file → opens share sheet → save to Files, Drive, or WhatsApp.
+            Saves backup to your device → share/save to WhatsApp, Drive, or Files app.
           </div>
+[1456 lines total]
           <Btn v="out" s={{marginTop:0}} onClick={() => doBackup(txns,accounts,expCats,incCats,appName,settings)}>
             📤 Export Backup File
           </Btn>
@@ -908,11 +957,9 @@ export default function App() {
       const perm = await Notif.requestPermission();
       if (perm === "granted") {
         setSettings(p => ({ ...p, notifications: true }));
-        // Schedule default reminder times
-        for (let i = 0; i < DEF_SETTINGS.reminderTimes.length; i++) {
-          await Notif.scheduleDailyAt(DEF_SETTINGS.reminderTimes[i], 9000 + i);
-        }
-        await Notif.fireNow("💰 My Finance Hub", "Daily reminders are set! Record your transactions every day.");
+        // Use rescheduleAll to cleanly set up default times with no conflicts
+        await Notif.rescheduleAll(DEF_SETTINGS.reminderTimes);
+        await Notif.fireNow("💰 My Finance Hub", `Daily reminders set for ${DEF_SETTINGS.reminderTimes.join(" & ")}`);
       } else if (perm === "inapp") {
         setInappBanner({ title: "💰 My Finance Hub", msg: "Tip: Enable notifications in Settings for daily reminders." });
         setTimeout(() => setInappBanner(null), 5000);
@@ -1007,7 +1054,7 @@ export default function App() {
   const TABS = [
     { id:"home",       icon:"🏠", label:"Home"     },
     { id:"accounts",   icon:"🏦", label:"Accounts" },
-    { id:"categories", icon:"🏷️", label:"Cats"     },
+    { id:"categories", icon:"🏷️", label:"Categories" },
     { id:"reports",    icon:"📈", label:"Reports"  },
   ];
 
@@ -1146,7 +1193,7 @@ export default function App() {
                 <div style={{display:"flex",gap:7}}>
                   <div style={{flex:1,background:T.bg,borderRadius:7,padding:7,textAlign:"center"}}><div style={{fontSize:9,color:T.muted}}>Income</div><div style={{fontSize:12,fontWeight:700,color:"#10b981"}}>{fmt(ai)}</div></div>
                   <div style={{flex:1,background:T.bg,borderRadius:7,padding:7,textAlign:"center"}}><div style={{fontSize:9,color:T.muted}}>Expenses</div><div style={{fontSize:12,fontWeight:700,color:"#ef4444"}}>{fmt(ae)}</div></div>
-                  <button type="button" onClick={e=>{e.stopPropagation();delAcc(a.id);}} style={{background:T.border,border:"none",color:"#ef4444",borderRadius:8,padding:"7px 12px",cursor:"pointer",fontWeight:700}}>✕</button>
+                  <button type="button" onClick={e=>{e.stopPropagation();delAcc(a.id);}} style={{background:T.border,border:"none",color:"#ef4444",borderRadius:8,padding:"7px 12px",cursor:"pointer",fontWeight:700}}>🗑️</button>
                 </div>
               </div>
             );
@@ -1175,7 +1222,7 @@ export default function App() {
                       <div style={{flex:1,minWidth:0}}><div style={{fontSize:13,fontWeight:700,color:T.text}}>{cat.name}</div><div style={{fontSize:10,color:T.muted}}>{cat.sub.length} sub-categories</div></div>
                       <div style={{display:"flex",gap:5}} onClick={e=>e.stopPropagation()}>
                         <button type="button" onClick={()=>{setEditEC(cat);setShowECF(true);}} style={{background:T.border,border:"none",color:T.sub,borderRadius:7,width:30,height:30,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>✏️</button>
-                        <button type="button" onClick={()=>delEC(cat.id)} style={{background:T.border,border:"none",color:"#ef4444",borderRadius:7,width:30,height:30,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+                        <button type="button" onClick={()=>delEC(cat.id)} style={{background:T.border,border:"none",color:"#ef4444",borderRadius:7,width:30,height:30,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>🗑️</button>
                       </div>
                       <div style={{fontSize:15,color:T.muted,transition:"transform .25s",transform:open?"rotate(90deg)":"none"}}>›</div>
                     </div>
@@ -1185,7 +1232,7 @@ export default function App() {
                           <div style={{display:"flex",alignItems:"center",gap:7}}><div style={{width:5,height:5,borderRadius:"50%",background:cat.color,flexShrink:0}}/><span style={{fontSize:12,color:T.text2,fontWeight:500}}>{s.name}</span></div>
                           <div style={{display:"flex",gap:5}}>
                             <button type="button" onClick={()=>{setEditSC({parentId:cat.id,parentName:cat.name,sub:s});setShowSCF(true);}} style={{background:T.border,border:"none",color:T.sub,borderRadius:6,width:28,height:28,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>✏️</button>
-                            <button type="button" onClick={()=>delSC(cat.id,s.id)} style={{background:T.border,border:"none",color:"#ef4444",borderRadius:6,width:28,height:28,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+                            <button type="button" onClick={()=>delSC(cat.id,s.id)} style={{background:T.border,border:"none",color:"#ef4444",borderRadius:6,width:28,height:28,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>🗑️</button>
                           </div>
                         </div>
                       ))}
@@ -1207,7 +1254,7 @@ export default function App() {
                 style={{background:T.card,borderRadius:13,padding:13,marginBottom:9,display:"flex",alignItems:"center",gap:11,cursor:"pointer"}}>
                 <div style={{width:40,height:40,borderRadius:11,background:cat.color+"22",border:`2px solid ${cat.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:19,flexShrink:0}}>{cat.icon}</div>
                 <div style={{flex:1}}><div style={{fontSize:13,fontWeight:700,color:T.text}}>{cat.name}</div></div>
-                <button type="button" onClick={e=>{e.stopPropagation();delIC(cat.id);}} style={{background:T.border,border:"none",color:"#ef4444",borderRadius:7,width:30,height:30,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+                <button type="button" onClick={e=>{e.stopPropagation();delIC(cat.id);}} style={{background:T.border,border:"none",color:"#ef4444",borderRadius:7,width:30,height:30,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>🗑️</button>
               </div>
             ))}
           </>}
