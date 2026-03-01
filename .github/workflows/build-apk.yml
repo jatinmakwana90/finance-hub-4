@@ -47,26 +47,64 @@ jobs:
       - name: Update Gradle wrapper to 8.7
         run: cd android && ./gradlew wrapper --gradle-version=8.7 --distribution-type=bin
 
-      - name: Show AndroidManifest before patching
-        run: cat android/app/src/main/AndroidManifest.xml
-
-      - name: Apply security patches (VAPT)
+      - name: Show files before patching
         run: |
-          M="android/app/src/main/AndroidManifest.xml"
-          # Remove cleartext traffic (security requirement)
-          sed -i 's/android:usesCleartextTraffic="true"//g' "$M" || true
-          # Add notification permissions if missing
-          if ! grep -q "POST_NOTIFICATIONS" "$M"; then
-            sed -i 's|<uses-permission android:name="android.permission.INTERNET"/>|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>\n    <uses-permission android:name="android.permission.VIBRATE"/>|' "$M"
-          fi
-          echo "=== Patched Manifest ===" && cat "$M"
+          echo "=== build.gradle ===" && cat android/app/build.gradle
+          echo "=== AndroidManifest.xml ===" && cat android/app/src/main/AndroidManifest.xml
 
-      - name: Patch build.gradle SDK versions
+      - name: Patch build.gradle and AndroidManifest (safe Python)
         run: |
-          G="android/app/build.gradle"
-          sed -i 's/minSdkVersion [0-2][0-9]/minSdkVersion 24/g' "$G" || true
-          sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/g' "$G" || true
-          grep -E "minSdk|targetSdk|compileSdk" "$G" || true
+          python3 << 'PYEOF'
+          import re
+
+          # ── Patch build.gradle ──────────────────────────────────────
+          with open("android/app/build.gradle", "r") as f:
+              gradle = f.read()
+
+          # Only replace the number after minSdkVersion / targetSdkVersion
+          gradle = re.sub(r'(minSdkVersion\s+)\d+',    r'\g<1>24',  gradle)
+          gradle = re.sub(r'(targetSdkVersion\s+)\d+', r'\g<1>34',  gradle)
+
+          with open("android/app/build.gradle", "w") as f:
+              f.write(gradle)
+
+          print("build.gradle patched OK")
+          # Print relevant lines for verification
+          for line in gradle.splitlines():
+              if any(k in line for k in ["minSdk","targetSdk","compileSdk","versionCode","versionName"]):
+                  print(" ", line.strip())
+
+          # ── Patch AndroidManifest.xml ───────────────────────────────
+          with open("android/app/src/main/AndroidManifest.xml", "r") as f:
+              manifest = f.read()
+
+          # Remove cleartext traffic flag safely
+          manifest = manifest.replace('android:usesCleartextTraffic="true"', '')
+
+          # Add missing permissions before </manifest>
+          perms_to_add = [
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>',
+              '<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>',
+              '<uses-permission android:name="android.permission.VIBRATE"/>',
+          ]
+          for perm in perms_to_add:
+              perm_name = re.search(r'android:name="([^"]+)"', perm).group(1)
+              if perm_name not in manifest:
+                  manifest = manifest.replace('</manifest>', f'    {perm}\n</manifest>')
+                  print(f"Added: {perm_name}")
+              else:
+                  print(f"Already present: {perm_name}")
+
+          with open("android/app/src/main/AndroidManifest.xml", "w") as f:
+              f.write(manifest)
+
+          print("AndroidManifest.xml patched OK")
+          PYEOF
+
+      - name: Show patched files
+        run: |
+          echo "=== Patched build.gradle ===" && cat android/app/build.gradle
+          echo "=== Patched Manifest ===" && cat android/app/src/main/AndroidManifest.xml
 
       - name: Build debug APK
         run: cd android && ./gradlew assembleDebug --no-daemon --stacktrace -Dorg.gradle.jvmargs="-Xmx3g"
