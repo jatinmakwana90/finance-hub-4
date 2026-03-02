@@ -49,7 +49,10 @@ const Notif = {
     if (ln) {
       try {
         if (ln.createChannel) {
-          await ln.createChannel({ id:"finance_daily", name:"Daily Reminders", importance:4, vibration:true });
+          await ln.createChannel({
+            id: "finance_daily", name: "Daily Reminders",
+            importance: 5, vibration: true, sound: "default",
+          });
         }
         const r = await ln.requestPermissions();
         return r?.display === "granted" ? "granted" : "denied";
@@ -62,7 +65,8 @@ const Notif = {
     }
     return "inapp";
   },
-  // Cancel EVERY pending notification (clears stale ones from old versions too)
+
+  // Cancel every pending notification (wipes stale alarms from old versions too)
   async cancelAllPending() {
     const ln = Cap.plugin("LocalNotifications");
     if (!ln) return;
@@ -73,50 +77,77 @@ const Notif = {
       }
     } catch {}
   },
-  // Schedule a daily alarm at exact HH:MM using OS repeating alarm
-  // ID = h*1000+m (deterministic, no conflicts between times)
-  async scheduleDailyAt(hhmm) {
+
+  // WHY EXACT ALARMS: on:{hour,minute} uses AlarmManager.setRepeating() = INEXACT.
+  // Android batches inexact alarms and fires them whenever it wants.
+  // Solution: schedule individual at: alarms for each of next N days.
+  // Each uses AlarmManager.setExactAndAllowWhileIdle() = MUST fire at exact time.
+  async scheduleExactDays(hhmm, days = 14) {
     const ln = Cap.plugin("LocalNotifications");
-    if (!ln) return false;
+    if (!ln) return { ok: false, count: 0 };
     const [h, m] = hhmm.split(":").map(Number);
-    const id = h * 1000 + m;
-    try {
-      await ln.schedule({
-        notifications: [{
-          id, channelId: "finance_daily",
-          title: "💰 Finance Reminder",
-          body:  "Time to log today's transactions!",
-          // on:{hour,minute} = OS daily repeating alarm at exact time
-          schedule: { on: { hour: h, minute: m } },
-        }],
+    const baseId = (h * 1000 + m) * 100;  // e.g. "09:00" -> 900000
+    const now = new Date();
+    const notifications = [];
+
+    for (let d = 0; d <= days; d++) {
+      const fire = new Date(now);
+      fire.setDate(fire.getDate() + d);
+      fire.setHours(h, m, 0, 0);
+      if (fire.getTime() <= now.getTime()) continue;  // skip times already passed
+
+      notifications.push({
+        id: baseId + d,
+        channelId: "finance_daily",
+        title: "💰 Finance Reminder",
+        body: "Time to log today's transactions!",
+        schedule: {
+          at: fire,
+          allowWhileIdle: true,  // fires even in Android Doze mode
+        },
+        sound: "default",
       });
-      return true;
-    } catch (e) { console.warn("Notif schedule error:", e); return false; }
+    }
+
+    if (!notifications.length) return { ok: false, count: 0 };
+    try {
+      await ln.schedule({ notifications });
+      return { ok: true, count: notifications.length };
+    } catch (e) {
+      console.warn("Notif schedule error:", hhmm, e);
+      return { ok: false, count: 0 };
+    }
   },
-  // Cancel ALL then schedule fresh — prevents duplicate/stale alarms
+
+  // Cancel ALL stale alarms first, then schedule fresh 14-day window for each time
   async rescheduleAll(times) {
     await this.cancelAllPending();
     const results = [];
     for (const t of times) {
-      const ok = await this.scheduleDailyAt(t);
-      results.push({ time: t, ok });
+      const r = await this.scheduleExactDays(t, 14);
+      results.push({ time: t, ok: r.ok, count: r.count });
     }
     return results;
   },
-  // ONLY called by explicit user tap on "Test" button
+
+  // ONLY called when user taps the Test button — never called automatically
   async fireTestNow() {
     const ln = Cap.plugin("LocalNotifications");
     if (ln) {
       try {
-        await ln.schedule({ notifications:[{ id:99998, channelId:"finance_daily",
-          title:"🧪 Test Notification", body:"Notifications are working correctly!",
-          schedule:{ at: new Date(Date.now() + 1000) },
+        await ln.schedule({ notifications: [{
+          id: 99998,
+          channelId: "finance_daily",
+          title: "🧪 Test Notification",
+          body: "Notifications are working correctly!",
+          schedule: { at: new Date(Date.now() + 1500), allowWhileIdle: true },
+          sound: "default",
         }]});
         return "native";
       } catch {}
     }
     if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-      try { new Notification("🧪 Test", { body:"Working!" }); return "web"; } catch {}
+      try { new Notification("🧪 Test", { body: "Working!" }); return "web"; } catch {}
     }
     return "inapp";
   },
@@ -136,20 +167,31 @@ function toBase64(data) {
   return btoa(unescape(encodeURIComponent(String(data))));
 }
 
+// Generate timestamp string with date + time for filenames (no overwrites)
+function fileTimestamp() {
+  const n = new Date();
+  const pad = (v, l=2) => String(v).padStart(l, "0");
+  return `${n.getFullYear()}-${pad(n.getMonth()+1)}-${pad(n.getDate())}_` +
+         `${pad(n.getHours())}-${pad(n.getMinutes())}-${pad(n.getSeconds())}-${pad(n.getMilliseconds(),3)}`;
+}
+
+// Save file into Downloads/MyFinanceHub/ subfolder (creates folder if needed)
 async function saveFile(data, filename, mime) {
   const FS = Cap.plugin("Filesystem");
   const SH = Cap.plugin("Share");
+  // Always put files in MyFinanceHub subfolder
+  const folder = "MyFinanceHub";
+  const fullPath = `${folder}/${filename}`;
 
-  // ── APK: write to Cache then Share ──
   if (FS) {
     try {
       const b64 = toBase64(data);
-      // Try to write to DOWNLOADS first
       let uri = null;
+      // Try Downloads/MyFinanceHub/ first (most visible), then fallback dirs
       const dirsToTry = [
-        { dir: "DOWNLOADS",        path: filename },
-        { dir: "EXTERNAL_STORAGE", path: `Download/${filename}` },
-        { dir: "CACHE",            path: filename },
+        { dir: "DOWNLOADS",        path: fullPath },
+        { dir: "EXTERNAL_STORAGE", path: `Download/${fullPath}` },
+        { dir: "CACHE",            path: fullPath },
       ];
       for (const { dir, path } of dirsToTry) {
         try {
@@ -160,18 +202,17 @@ async function saveFile(data, filename, mime) {
         } catch {}
       }
       if (uri && SH) {
-        // Open Android share sheet → user saves to Files/Drive/WhatsApp
         await SH.share({ title: filename, url: uri, dialogTitle: `Save "${filename}" to…` });
         return { ok: true, method: "share", uri };
       }
       if (uri) {
-        alert(`✅ File saved!\n\nPath: ${uri}\n\nFind it in: Files app → Downloads (or search for "${filename}")`);
+        alert(`✅ Saved!\n\nFolder: Downloads → MyFinanceHub\nFile: ${filename}`);
         return { ok: true, method: "filesystem", uri };
       }
     } catch (e) { console.warn("Filesystem save failed:", e); }
   }
 
-  // ── Browser: blob download ──
+  // Browser fallback: blob download
   try {
     const blob = new Blob([data], { type: mime });
     const url = URL.createObjectURL(blob);
@@ -201,14 +242,14 @@ function buildRows(txns, expCats, incCats) {
 async function exportCSV(txns,eC,iC) {
   const rows=buildRows(txns,eC,iC), h=["Date","Amount","Type","Category","Remarks"];
   const csv=[h.join(","),...rows.map(r=>h.map(k=>`"${String(r[k]??"").replace(/"/g,'""')}"`).join(","))].join("\n");
-  return saveFile("\uFEFF"+csv,"transactions.csv","text/csv;charset=utf-8;");
+  return saveFile("\uFEFF"+csv,`transactions-${fileTimestamp()}.csv`,"text/csv;charset=utf-8;");
 }
 async function exportExcel(txns,eC,iC) {
   const rows=buildRows(txns,eC,iC);
   const ws=XLSX.utils.json_to_sheet(rows); ws["!cols"]=[{wch:14},{wch:14},{wch:10},{wch:32},{wch:30}];
   const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"Transactions");
   const buf=XLSX.write(wb,{bookType:"xlsx",type:"array"});
-  return saveFile(new Uint8Array(buf),"transactions.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  return saveFile(new Uint8Array(buf),`transactions-${fileTimestamp()}.xlsx`,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
 }
 // #8 #9: PDF — show INLINE in app (iframe overlay), back button works inside app
 // Also offer "Save File" to share/download the HTML
@@ -252,137 +293,55 @@ tr:nth-child(even) td{background:#f8fafc}
 }
 
 // PDF Viewer component — fullscreen in-app overlay, system back = close overlay
-function PDFViewer({ html, onClose, appName, onSave }) {
+// PDFViewer — fullscreen in-app iframe, prints to PDF via system dialog
+// Android hardware back button is intercepted via Capacitor App plugin
+function PDFViewer({ html, onClose, appName }) {
   const iframeRef = useRef();
-  // Write to iframe using srcdoc (no window.open, stays in-app, back button works via onClose)
+
+  useEffect(() => {
+    // Intercept Android hardware back button to close viewer instead of exiting app
+    const AppPlugin = Cap.plugin("App");
+    let listener = null;
+    if (AppPlugin?.addListener) {
+      AppPlugin.addListener("backButton", () => { onClose(); }).then(l => { listener = l; });
+    }
+    // Also handle browser history back (popstate)
+    const onPop = (e) => { e.preventDefault(); onClose(); };
+    window.history.pushState({ pdfOpen: true }, "");
+    window.addEventListener("popstate", onPop);
+
+    return () => {
+      if (listener?.remove) listener.remove();
+      window.removeEventListener("popstate", onPop);
+    };
+  }, [onClose]);
+
+  function printReport() {
+    // Trigger system print dialog inside iframe — user selects "Save as PDF"
+    iframeRef.current?.contentWindow?.print();
+  }
+
   return (
     <div style={{position:"fixed",inset:0,zIndex:2000,background:"#f8fafc",display:"flex",flexDirection:"column"}}>
-      {/* Toolbar */}
       <div style={{background:"#0f172a",padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
-        <button type="button" onClick={onClose}
-          style={{background:"rgba(255,255,255,.15)",border:"none",color:"#fff",borderRadius:8,padding:"7px 13px",cursor:"pointer",fontWeight:700,fontSize:13}}>
-          ← Back
-        </button>
         <span style={{color:"#fff",fontWeight:700,fontSize:14}}>📋 {appName} Report</span>
-        <div style={{display:"flex",gap:7}}>
-          <button type="button" onClick={() => iframeRef.current?.contentWindow?.print()}
-            style={{background:"#10b981",border:"none",color:"#fff",borderRadius:8,padding:"7px 13px",cursor:"pointer",fontWeight:700,fontSize:12}}>
-            🖨️ Print/PDF
-          </button>
-          <button type="button" onClick={onSave}
-            style={{background:"#3b82f6",border:"none",color:"#fff",borderRadius:8,padding:"7px 13px",cursor:"pointer",fontWeight:700,fontSize:12}}>
-            💾 Save
-          </button>
-        </div>
+        <button type="button" onClick={printReport}
+          style={{background:"#10b981",border:"none",color:"#fff",borderRadius:8,padding:"9px 18px",cursor:"pointer",fontWeight:700,fontSize:13}}>
+          🖨️ Print / Save as PDF
+        </button>
       </div>
-      {/* iframe — srcdoc keeps it in-app */}
+      <div style={{background:"#1e293b",padding:"8px 14px",fontSize:11,color:"#94a3b8",lineHeight:1.5}}>
+        Tap <b style={{color:"#fff"}}>Print / Save as PDF</b> → in the print dialog, change destination to <b style={{color:"#fff"}}>"Save as PDF"</b> → tap Save. Press your phone's <b style={{color:"#fff"}}>Back button</b> to return.
+      </div>
       <iframe ref={iframeRef} srcDoc={html} style={{flex:1,border:"none",width:"100%"}} title="Report"/>
     </div>
   );
 }
 
-// Backup (#6 fix)
+// Backup — saved to Downloads/MyFinanceHub/ with full timestamp (never overwrites)
 async function doBackup(txns,accounts,eC,iC,appName,settings) {
-  const json=JSON.stringify({version:"6.0",backupDate:new Date().toISOString(),transactions:txns,accounts,expCats:eC,incCats:iC,appName,settings},null,2);
-  return saveFile(json,`finance-backup-${toYMD(new Date())}.json`,"application/json;charset=utf-8;");
-}
-
-// #11: JPG/PNG export — renders summary to Canvas
-async function exportJPG(accounts, accBal, txns, period, appName, T) {
-  const W=400, H=280, dpr=window.devicePixelRatio||2;
-  const c=document.createElement("canvas"); c.width=W*dpr; c.height=H*dpr;
-  const ctx=c.getContext("2d"); ctx.scale(dpr,dpr);
-  ctx.fillStyle="#0f1420"; ctx.fillRect(0,0,W,H);
-  const grad=ctx.createLinearGradient(0,0,W,60);
-  grad.addColorStop(0,"#0f1420"); grad.addColorStop(1,"#1a2744");
-  ctx.fillStyle=grad; ctx.fillRect(0,0,W,60);
-  ctx.fillStyle="#fff"; ctx.font="bold 15px system-ui,sans-serif";
-  ctx.fillText("💰 "+appName, 16, 24);
-  ctx.fillStyle="#94a3b8"; ctx.font="11px system-ui,sans-serif";
-  ctx.fillText(new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"}), 16, 42);
-  const cardW=90, cardH=70, startX=16, startY=72, gap=10;
-  accounts.slice(0,4).forEach((a,i)=>{
-    const x=startX+(cardW+gap)*i, y=startY;
-    ctx.fillStyle="#1a1f2e"; ctx.beginPath(); ctx.roundRect(x,y,cardW,cardH,8); ctx.fill();
-    const b=accBal[a.id]||0;
-    ctx.fillStyle=a.color; ctx.fillRect(x,y,cardW,3);
-    ctx.fillStyle="#f1f5f9"; ctx.font="bold 11px system-ui,sans-serif";
-    ctx.fillText(a.icon+" "+(a.name.length>10?a.name.slice(0,9)+"…":a.name), x+8, y+22);
-    ctx.fillStyle=b>=0?"#10b981":"#ef4444"; ctx.font="bold 13px system-ui,sans-serif";
-    ctx.fillText((b<0?"-":"")+"₹"+Math.abs(b).toLocaleString("en-IN").slice(0,10), x+8, y+44);
-    ctx.fillStyle="#64748b"; ctx.font="9px system-ui,sans-serif"; ctx.fillText("Balance", x+8, y+60);
-  });
-  const now=new Date(), mo=now.getMonth(), yr=now.getFullYear();
-  const ptxns=txns.filter(t=>{const d=new Date(t.date);return d>=new Date(yr,mo,1)&&d<=now;});
-  const inc=ptxns.filter(t=>t.type==="income").reduce((s,t)=>s+t.amount,0);
-  const exp=ptxns.filter(t=>t.type==="expense").reduce((s,t)=>s+t.amount,0);
-  [{label:"Income",val:inc,col:"#10b981"},{label:"Expense",val:exp,col:"#ef4444"},{label:"Saved",val:inc-exp,col:T.acc}].forEach((c2,i)=>{
-    const x=16+i*130, y=160;
-    ctx.fillStyle="#1a1f2e"; ctx.beginPath(); ctx.roundRect(x,y,120,70,8); ctx.fill();
-    ctx.fillStyle=c2.col; ctx.fillRect(x,y,120,3);
-    ctx.fillStyle="#94a3b8"; ctx.font="9px system-ui,sans-serif"; ctx.fillText(c2.label.toUpperCase(),x+10,y+22);
-    ctx.fillStyle=c2.col; ctx.font="bold 14px system-ui,sans-serif";
-    ctx.fillText("₹"+Math.abs(c2.val).toLocaleString("en-IN").slice(0,10),x+10,y+46);
-    ctx.fillStyle="#64748b"; ctx.font="9px system-ui,sans-serif"; ctx.fillText("This Month",x+10,y+62);
-  });
-  ctx.fillStyle="#334155"; ctx.font="9px system-ui,sans-serif";
-  ctx.fillText("My Finance Hub · Exported "+new Date().toLocaleString("en-IN"),16,H-10);
-  // Convert canvas to Uint8Array and save
-  return new Promise(resolve=>{
-    c.toBlob(async blob=>{
-      const buf=await blob.arrayBuffer();
-      const result=await saveFile(new Uint8Array(buf),`finance-summary-${toYMD(new Date())}.png`,"image/png");
-      resolve(result);
-    },"image/png");
-  });
-}
-
-// ─── SMS PARSER (#7 improved patterns) ─────────────────────────────────────
-// #7: SMS parser — handles UPI transfer, bank debit/credit, all major Indian bank formats
-function parseSMS(text) {
-  if (!text || text.length < 15) return null;
-  const t = text.replace(/,/g,"").replace(/\s+/g," ").trim();
-
-  // Amount: Rs. 1234 / INR 1234 / ₹1234 / Rs 1,234.56
-  const amMatch = t.match(/(?:Rs\.?\s*|INR\s*|₹\s*)(\d+(?:\.\d{1,2})?)/i);
-  if (!amMatch) return null;
-  const amount = parseFloat(amMatch[1]);
-  if (!amount || amount <= 0 || amount > 50000000) return null;
-
-  // UPI transfer SMS — treat as expense (money left account)
-  const isUPISent = /\b(?:sent|transferred?|paid)\b.{0,60}(?:upi|vpa|@|upi id)/i.test(t) ||
-    /upi.{0,30}(?:sent|transferred?|paid|debit)/i.test(t);
-
-  // Debit keywords
-  const isDebit = isUPISent || /\b(?:debited?|deducted?|spent|paid|payment|withdrawn?|purchase|charged|transferred? to)\b/i.test(t);
-
-  // Credit keywords
-  const isCredit = /\b(?:credited?|received?|deposited?|refund|cashback|added|reversed?|received from|transferred? from)\b/i.test(t);
-
-  if (!isDebit && !isCredit) {
-    // Last resort: if has "UPI" and debit-like context
-    if (!/\b(?:upi|neft|imps|rtgs|bank|account|ac|a\/c)\b/i.test(t)) return null;
-    // If has balance info and nothing else, can't determine type
-    return null;
-  }
-
-  // If both matched (e.g. "credited to" in debit SMS), prefer explicit debit
-  const type = isDebit ? "expense" : "income";
-
-  // Extract merchant/payee note
-  let note = "";
-  const patterns = [
-    /(?:to|at|towards?)\s+([A-Za-z0-9&'.()/ -]{2,40}?)(?:\s+(?:on|via|ref|upi|vpa|for)\b|\.|,|$)/i,
-    /VPA\s+([A-Za-z0-9._@-]{3,40})/i,
-    /UPI[- ]?(?:ID|VPA|REF)?[:\s]+([A-Za-z0-9._@-]{3,40})/i,
-    /(?:from|by)\s+([A-Za-z0-9&'.()/ -]{2,40}?)(?:\s+(?:on|via|ref)\b|\.|,|$)/i,
-  ];
-  for (const p of patterns) {
-    const m = t.match(p);
-    if (m && m[1] && m[1].length > 1) { note = m[1].trim(); break; }
-  }
-
-  return { type, amount, note: note || (isUPISent ? "UPI Transfer" : "SMS Transaction") };
+  const json=JSON.stringify({version:"7.0",backupDate:new Date().toISOString(),transactions:txns,accounts,expCats:eC,incCats:iC,appName,settings},null,2);
+  return saveFile(json,`backup-${fileTimestamp()}.json`,"application/json;charset=utf-8;");
 }
 
 // ─── THEMES ──────────────────────────────────────────────────────────────────
@@ -413,7 +372,7 @@ const PERIODS = [
 // Fix #4: added carryForward to default settings
 const DEF_SETTINGS = {
   uiMode:"auto", notifications:false, reminderTimes:["09:00","21:00"],
-  smsDetection:true, carryForward:true,
+  smsDetection:false, carryForward:true,
 };
 
 // ─── DEFAULT DATA (Fix #3: openingBal added to accounts) ─────────────────────
@@ -596,8 +555,8 @@ function TxnForm({accounts,expCats,incCats,onSave,onClose,editT,prefill}){
     onSave({id:editT?.id||uid(),date,type,accountId:accId,toAccountId:type==="transfer"?toAccId:null,catId:type==="transfer"?null:catId,subCatId:type==="expense"?subId:null,amount:parseFloat(amt),note});
   };
   return(
-    <Modal title={editT?"Edit Transaction":prefill?"Add from SMS":"Add Transaction"} onClose={onClose}>
-      {prefill&&<div style={{background:"#10b98122",border:"1px solid #10b981",borderRadius:10,padding:"9px 13px",marginBottom:13,fontSize:12,color:"#10b981"}}>💬 ₹{prefill.amount} detected from SMS</div>}
+    <Modal title={editT?"Edit Transaction":prefill?"Add Transaction":"Add Transaction"} onClose={onClose}>
+      {prefill&&<div style={{background:"#10b98122",border:"1px solid #10b981",borderRadius:10,padding:"9px 13px",marginBottom:13,fontSize:12,color:"#10b981"}}>💬 Pre-filled: ₹{prefill.amount}</div>}
       {/* Type selector */}
       <div style={{display:"flex",gap:7,marginBottom:16}}>
         {[{v:"expense",label:"🔴 Expense",col:"#ef4444"},{v:"income",label:"🟢 Income",col:"#10b981"},{v:"transfer",label:"🔄 Transfer",col:"#3b82f6"}].map(({v,label,col})=>(
@@ -676,16 +635,14 @@ function IncCatForm({onSave,onClose,editC}){
 function ExportModal({onClose,txns,expCats,incCats,periodLabel,appName,accounts,accBal,T}){
   const[busy,setBusy]=useState(null);
   const[done,setDone]=useState(null);
-  const[pdfHtml,setPdfHtml]=useState(null); // null = show menu, string = show PDF viewer
+  const[pdfHtml,setPdfHtml]=useState(null);
   const opts=[
-    {id:"csv",  icon:"📄",label:"CSV File",      desc:"Saved to Downloads — open in Excel or Google Sheets"},
-    {id:"excel",icon:"📊",label:"Excel (.xlsx)", desc:"Full spreadsheet — saved to Downloads folder"},
-    {id:"pdf",  icon:"🖨️",label:"PDF Report",    desc:"View inside app → tap Print/PDF to save as PDF"},
-    {id:"jpg",  icon:"🖼️",label:"Summary Image", desc:"Account summary as PNG image — saved to Downloads"},
+    {id:"csv",  icon:"📄",label:"CSV File",      desc:"Saved to Downloads/MyFinanceHub/ — open in Excel or Sheets"},
+    {id:"excel",icon:"📊",label:"Excel (.xlsx)", desc:"Full spreadsheet — saved to Downloads/MyFinanceHub/"},
+    {id:"pdf",  icon:"🖨️",label:"PDF Report",    desc:"View inside app → tap Print → Save as PDF"},
   ];
   async function go(id){
     if(id==="pdf"){
-      // #8 #9: Show PDF INSIDE app (no external browser), back button returns here
       const html=buildPDFHtml(txns,expCats,incCats,periodLabel,appName);
       setPdfHtml(html);
       return;
@@ -694,19 +651,12 @@ function ExportModal({onClose,txns,expCats,incCats,periodLabel,appName,accounts,
     try{
       if(id==="csv")   await exportCSV(txns,expCats,incCats);
       if(id==="excel") await exportExcel(txns,expCats,incCats);
-      if(id==="jpg")   await exportJPG(accounts,accBal,txns,"mtd",appName,T);
       setDone(id);
     }catch(e){alert("Export error: "+e.message);}
     setBusy(null);
   }
-  // Show in-app PDF viewer (covers full screen, ← Back returns to this modal)
   if(pdfHtml) return(
-    <PDFViewer
-      html={pdfHtml}
-      appName={appName}
-      onClose={()=>setPdfHtml(null)}
-      onSave={()=>saveFile(pdfHtml,`${appName.replace(/\s+/g,"-")}-report.html`,"text/html;charset=utf-8;")}
-    />
+    <PDFViewer html={pdfHtml} appName={appName} onClose={()=>setPdfHtml(null)}/>
   );
   return(
     <Modal title="📤 Export" onClose={onClose}>
@@ -727,7 +677,7 @@ function ExportModal({onClose,txns,expCats,incCats,periodLabel,appName,accounts,
         </div>
       ))}
       <div style={{background:"#3b82f615",border:"1px solid #3b82f644",borderRadius:10,padding:"10px 13px",fontSize:11,color:"var(--sub)",marginTop:4,lineHeight:1.6}}>
-        📱 Tap any option → share sheet opens → choose <b style={{color:"var(--text)"}}>Save to Files</b>, WhatsApp, Drive, or Gmail.
+        📁 Files saved to <b style={{color:"var(--text)"}}>Downloads → MyFinanceHub</b> folder. Share sheet lets you send to WhatsApp, Drive, or Gmail too.
       </div>
     </Modal>
   );
@@ -739,7 +689,6 @@ function SettingsModal({settings,onChange,onClose,txns,accounts,expCats,incCats,
   const[notifPerm,setNotifPerm]=useState("checking");
   const[notifMsg, setNotifMsg] =useState("");
   const[newTime,  setNewTime]  =useState("08:00");
-  const[smsStatus,setSmsStatus]=useState("");
   const[busyNotif,setBusyNotif]=useState(false);
   const set=(k,v)=>onChange({...settings,[k]:v});
 
@@ -797,13 +746,6 @@ function SettingsModal({settings,onChange,onClose,txns,accounts,expCats,incCats,
     }
   }
 
-  // Fix #7: SMS test
-  function testSMS(){
-    const sample="Dear Customer, Rs.2500 debited from your HDFC Bank account ending 1234 to SWIGGY on 01-03-2026.";
-    const p=parseSMS(sample);
-    setSmsStatus(p?`✅ Parser works! Detected: ₹${p.amount} ${p.type} (${p.note}).\n\nNow copy a real bank SMS then come back to the app.`:"❌ Parse failed — try copying an actual bank SMS.");
-  }
-
   function handleRestore(file){
     const r=new FileReader();
     r.onload=e=>{
@@ -852,7 +794,7 @@ function SettingsModal({settings,onChange,onClose,txns,accounts,expCats,incCats,
         </div>
         {settings.notifications&&(
           <div style={{background:"var(--inp)",borderRadius:10,padding:12,marginTop:10}}>
-            <FL c="Reminder times (exact daily alarms — work when app is closed)"/>
+            <FL c="Reminder times"/>
             {settings.reminderTimes.map(t=>(
               <div key={t} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:"var(--card)",borderRadius:8,padding:"7px 11px",marginBottom:5}}>
                 <span style={{fontSize:14,fontWeight:700,color:"var(--text)"}}>⏰ {t}</span>
@@ -864,42 +806,23 @@ function SettingsModal({settings,onChange,onClose,txns,accounts,expCats,incCats,
                 style={{flex:1,background:"var(--card)",border:"1px solid var(--bdr)",borderRadius:8,padding:"7px 11px",color:"var(--text)",fontSize:13,outline:"none"}}/>
               <button type="button" onClick={addTime} style={{background:"var(--acc)",border:"none",color:"#fff",borderRadius:8,padding:"7px 14px",cursor:"pointer",fontWeight:700,fontSize:12}}>+ Add</button>
             </div>
-            {/* Fix #2: Only fires when user explicitly taps this */}
             <button type="button" onClick={async()=>{
               const r=await Notif.fireTestNow();
-              if(r==="inapp") alert("📲 Native notifications unavailable. Check Android Settings → Notifications.");
-              else alert("✅ Test notification sent! Check your notification tray.");
+              if(r==="inapp") alert("📲 Test failed. Check Android Settings → Apps → My Finance Hub → Notifications → Allow.");
+              else alert("✅ Test notification sent! You should see it in your notification tray within 2 seconds.");
             }} style={{marginTop:9,width:"100%",background:"var(--bdr)",border:"none",color:"var(--text)",borderRadius:8,padding:"9px",cursor:"pointer",fontWeight:700,fontSize:12}}>
               🧪 Send Test Notification Now
             </button>
-            <div style={{marginTop:8,fontSize:10,color:"var(--muted)",lineHeight:1.5}}>
-              ⚠️ If not received: Android Settings → Apps → My Finance Hub → Battery → No Restrictions (prevents Doze mode killing alarms)
+            <div style={{marginTop:9,background:"#f59e0b15",border:"1px solid #f59e0b44",borderRadius:8,padding:"10px 12px",fontSize:11,color:"var(--sub)",lineHeight:1.7}}>
+              <b style={{color:"#f59e0b"}}>If notifications are late or missing:</b><br/>
+              Android Settings → Apps → <b style={{color:"var(--text)"}}>My Finance Hub</b> → Battery → set to <b style={{color:"var(--text)"}}>Unrestricted</b><br/>
+              <span style={{fontSize:10,opacity:.7}}>This prevents Android from killing alarms in the background.</span>
             </div>
           </div>
         )}
       </div>
 
-      {/* Fix #7: SMS */}
-      <Toggle on={settings.smsDetection} onChange={v=>set("smsDetection",v)} label="📱 SMS Auto-Detection" sub="Auto-reads bank/UPI SMS from clipboard"/>
-      {settings.smsDetection&&(
-        <div style={{background:"var(--inp)",borderRadius:10,padding:12,marginTop:8,marginBottom:4}}>
-          <div style={{fontSize:12,fontWeight:700,color:"var(--text)",marginBottom:7}}>How it works:</div>
-          <div style={{background:"var(--card)",borderRadius:8,padding:"10px 12px",marginBottom:8}}>
-            {["1️⃣  Receive a bank / UPI SMS","2️⃣  Long press the SMS → tap Copy","3️⃣  Open or switch to this app","4️⃣  Green banner auto-appears — tap Add"].map((s,i)=>(
-              <div key={i} style={{fontSize:12,color:"var(--text)",marginBottom:i<3?5:0,lineHeight:1.5}}>{s}</div>
-            ))}
-          </div>
-          <div style={{background:"#f59e0b15",border:"1px solid #f59e0b44",borderRadius:8,padding:"9px 12px",marginBottom:8,fontSize:11,color:"var(--sub)"}}>
-            <b style={{color:"#f59e0b"}}>Important:</b> Android 10+ may ask "Allow [app] to read clipboard?" — tap <b>Allow</b>. This prompt appears when you switch to the app after copying.
-          </div>
-          <button type="button" onClick={testSMS} style={{width:"100%",background:"var(--acc)",border:"none",color:"#fff",borderRadius:9,padding:"10px",cursor:"pointer",fontWeight:700,fontSize:12,marginBottom:smsStatus?8:0}}>
-            🧪 Test SMS Parser
-          </button>
-          {smsStatus&&<div style={{fontSize:11,color:"var(--sub)",background:"var(--card)",borderRadius:8,padding:"9px 11px",lineHeight:1.6,whiteSpace:"pre-wrap"}}>{smsStatus}</div>}
-        </div>
-      )}
-
-      {/* Fix #4: CARRY FORWARD */}
+      {/* CARRY FORWARD */}
       <Toggle on={settings.carryForward!==false} onChange={v=>set("carryForward",v)}
         label="📊 Carry Forward Balance"
         sub={settings.carryForward!==false?"Period starts with previous balance (cumulative)":"Period starts from ₹0 (period-only view)"}/>
@@ -909,7 +832,7 @@ function SettingsModal({settings,onChange,onClose,txns,accounts,expCats,incCats,
         <FL c="Backup & Restore"/>
         <div style={{background:"var(--inp)",borderRadius:11,padding:13}}>
           <div style={{fontSize:13,fontWeight:600,color:"var(--text)",marginBottom:3}}>💾 Backup All Data</div>
-          <div style={{fontSize:11,color:"var(--muted)",marginBottom:9}}>Saves .json to Downloads folder → share to Drive or WhatsApp</div>
+          <div style={{fontSize:11,color:"var(--muted)",marginBottom:9}}>Saved to <b>Downloads → MyFinanceHub</b> folder</div>
           <Btn v="out" s={{marginTop:0}} onClick={()=>doBackup(txns,accounts,expCats,incCats,appName,settings)}>
             📤 Export Backup File
           </Btn>
@@ -986,7 +909,6 @@ export default function App(){
   const[editSC, setEditSC] = useState(null);
   const[editIC, setEditIC] = useState(null);
   const[prefill,setPrefill]= useState(null);
-  const[smsToast,setSmsToast]=useState(null);
   const[inappBanner,setInappBanner]=useState(null);
 
   // ── Theme ──
@@ -1000,7 +922,7 @@ export default function App(){
     document.body.style.background=T.bg;
   },[T]);
 
-  // ── First-open: ask notification permission (no immediate fire) ──
+  // ── First-open: ask notification permission ──
   useEffect(()=>{
     if(localStorage.getItem("v6NotifAsked"))return;
     localStorage.setItem("v6NotifAsked","1");
@@ -1009,63 +931,36 @@ export default function App(){
       if(perm==="granted"){
         setSettings(p=>({...p,notifications:true}));
         await Notif.rescheduleAll(DEF_SETTINGS.reminderTimes);
-        // No fireNow here — notifications will come at scheduled times only
-        setInappBanner({title:"🔔 Reminders Set",msg:`Daily alarms scheduled for ${DEF_SETTINGS.reminderTimes.join(" & ")}`});
+        setInappBanner({title:"🔔 Reminders Set",msg:`Daily alarms set for ${DEF_SETTINGS.reminderTimes.join(" & ")}`});
         setTimeout(()=>setInappBanner(null),5000);
       }
     },2500);
   // eslint-disable-next-line
   },[]);
 
-  // #7: SMS detection — clipboard polling + visibilitychange + focus event
-  // On Android: copy SMS → switch back to app → visibilitychange fires → clipboard read
+  // ── Refresh 14-day alarm window on every app open / foreground ──
+  // This ensures alarms never expire. Each app open extends the window 14 more days.
   useEffect(()=>{
-    if(!settings.smsDetection) return;
-    let lastClip="";
-    let lastToastTime=0;
-
-    async function checkClip(){
+    async function refreshAlarms(){
+      const perm=await Notif.getPermission();
+      if(perm!=="granted")return;
+      // Read latest settings from localStorage directly (state may be stale in closure)
       try{
-        let text="";
-        const CB=Cap.plugin("Clipboard");
-        if(CB){
-          // Capacitor Clipboard plugin — works natively without permission prompt
-          const r=await CB.read();
-          text=r?.value||r?.plainText||r?.string||"";
-        } else if(navigator.clipboard?.readText){
-          text=await navigator.clipboard.readText();
+        const raw=localStorage.getItem("set6");
+        const s=raw?JSON.parse(raw):null;
+        if(s?.notifications&&s?.reminderTimes?.length){
+          await Notif.rescheduleAll(s.reminderTimes);
         }
-        if(!text || text.length<15) return;
-        if(text===lastClip) return;
-        lastClip=text;
-        const now=Date.now();
-        if(now-lastToastTime<8000) return; // debounce: no toast spam
-        const p=parseSMS(text);
-        if(p){
-          lastToastTime=now;
-          setSmsToast(p);
-          setTimeout(()=>setSmsToast(null),18000);
-        }
-      } catch {}
+      }catch{}
     }
-
-    // Primary: check when app becomes visible (user switched back after copying SMS)
-    const onVisible=()=>{ if(!document.hidden) setTimeout(checkClip, 200); };
-    document.addEventListener("visibilitychange", onVisible);
-
-    // Secondary: check on window focus (covers desktop / PWA)
-    const onFocus=()=>setTimeout(checkClip, 200);
-    window.addEventListener("focus", onFocus);
-
-    // Tertiary: poll every 3s while visible (catches cases where app was already open)
-    const tick=setInterval(()=>{ if(!document.hidden) checkClip(); }, 3000);
-
-    return()=>{
-      clearInterval(tick);
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onFocus);
-    };
-  },[settings.smsDetection]);
+    // Run on mount
+    refreshAlarms();
+    // Re-run every time app comes back to foreground
+    const onVisible=()=>{ if(!document.hidden) refreshAlarms(); };
+    document.addEventListener("visibilitychange",onVisible);
+    return()=>document.removeEventListener("visibilitychange",onVisible);
+  // eslint-disable-next-line
+  },[]);
 
   // ── Restore handler ──
   useEffect(()=>{
@@ -1187,19 +1082,6 @@ export default function App(){
         <div style={{position:"fixed",top:14,left:"50%",transform:"translateX(-50%)",zIndex:4000,background:"var(--acc)",borderRadius:13,padding:"11px 15px",maxWidth:440,width:"calc(100% - 28px)",boxShadow:"0 6px 28px rgba(0,0,0,.5)",display:"flex",gap:11,alignItems:"center"}}>
           <div style={{flex:1}}><div style={{fontSize:13,fontWeight:700,color:"#fff"}}>{inappBanner.title}</div><div style={{fontSize:11,color:"rgba(255,255,255,.8)",marginTop:1}}>{inappBanner.msg}</div></div>
           <button type="button" onClick={()=>setInappBanner(null)} style={{background:"rgba(255,255,255,.2)",border:"none",color:"#fff",borderRadius:7,padding:"5px 10px",cursor:"pointer",fontSize:13}}>✕</button>
-        </div>
-      )}
-
-      {/* SMS TOAST */}
-      {smsToast&&(
-        <div style={{position:"fixed",top:14,left:"50%",transform:"translateX(-50%)",zIndex:3500,background:"#10b981",borderRadius:13,padding:"11px 15px",maxWidth:440,width:"calc(100% - 28px)",boxShadow:"0 6px 28px rgba(0,0,0,.5)",display:"flex",gap:11,alignItems:"center"}}>
-          <div style={{fontSize:21,flexShrink:0}}>📱</div>
-          <div style={{flex:1}}>
-            <div style={{fontSize:13,fontWeight:700,color:"#fff"}}>SMS: {smsToast.type==="expense"?"Expense":"Income"} ₹{smsToast.amount}</div>
-            <div style={{fontSize:11,color:"rgba(255,255,255,.85)"}}>{smsToast.note}</div>
-          </div>
-          <button type="button" onClick={()=>{setPrefill(smsToast);setSmsToast(null);setShowTF(true);}} style={{background:"rgba(255,255,255,.22)",border:"none",color:"#fff",borderRadius:7,padding:"5px 11px",cursor:"pointer",fontWeight:700,fontSize:12,flexShrink:0}}>Add</button>
-          <button type="button" onClick={()=>setSmsToast(null)} style={{background:"rgba(255,255,255,.15)",border:"none",color:"#fff",borderRadius:7,padding:"5px 9px",cursor:"pointer",fontSize:13}}>✕</button>
         </div>
       )}
 
